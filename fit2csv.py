@@ -12,7 +12,7 @@ import importlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -26,6 +26,24 @@ def get_fitdecode():
     if _fitdecode_module is None:
         _fitdecode_module = importlib.import_module('fitdecode')
     return _fitdecode_module
+
+
+def decode_fit_data(fit_data: bytes) -> List[Any]:
+    """Decode FIT data using the appropriate API for the installed version."""
+    fitdecode_module = get_fitdecode()
+    
+    # Try new API (FitReader) first (version 0.11.0+)
+    if hasattr(fitdecode_module, 'FitReader'):
+        messages = []
+        import io
+        with fitdecode_module.FitReader(io.BytesIO(fit_data)) as fit:
+            for frame in fit:
+                if frame.frame_type == fitdecode_module.FIT_FRAME_DATA:
+                    messages.append(frame)
+        return messages
+    else:
+        # Fall back to old API (decode function)
+        return list(fitdecode_module.decode(fit_data))
 
 
 # Constants for FIT field scaling
@@ -100,21 +118,39 @@ def get_fit_files(input_path: str) -> List[Path]:
         sys.exit(1)
 
 
-def convert_timestamp(ts: Optional[float]) -> str:
-    """Convert FIT timestamp (seconds since UTC 00:00 Dec 31 1989) to ISO 8601."""
+def convert_timestamp(ts: Optional[Any]) -> str:
+    """Convert FIT timestamp to ISO 8601.
+    
+    Handles both float timestamps (seconds since FIT epoch) and datetime objects.
+    """
     if ts is None:
         return ""
+    # If already a datetime object
+    if hasattr(ts, 'strftime'):
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     # FIT timestamp is seconds since 1989-12-31 00:00:00 UTC
     fit_epoch = datetime(1989, 12, 31, tzinfo=timezone.utc)
-    dt = fit_epoch + datetime.timedelta(seconds=ts)
+    dt = fit_epoch + timedelta(seconds=ts)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def get_field_value(message: Any, field_name: str) -> Any:
-    """Get field value from FIT message, handling None and scaling."""
-    if field_name not in message:
+    """Get field value from FIT message, handling None and scaling.
+    
+    Supports both old API (dict-like messages) and new API (FitDataMessage with fields).
+    """
+    # New API: message has 'fields' attribute
+    if hasattr(message, 'fields'):
+        for field in message.fields:
+            if field.name == field_name:
+                return field.value
         return None
-    return message[field_name]
+    # Old API: message is dict-like
+    elif hasattr(message, '__getitem__'):
+        if field_name in message:
+            return message[field_name]
+        return None
+    return None
 
 
 def process_fit_file(
@@ -136,12 +172,22 @@ def process_fit_file(
         fitdecode_module = get_fitdecode()
         if verify:
             try:
-                fitdecode_module.checksum.verify_checksum(fit_data)
-            except fitdecode_module.checksum.ChecksumError as e:
+                if hasattr(fitdecode_module, 'checksum'):
+                    fitdecode_module.checksum.verify_checksum(fit_data)
+                else:
+                    # New API: use FitReader with check_crc parameter
+                    import io
+                    with fitdecode_module.FitReader(
+                        io.BytesIO(fit_data), 
+                        check_crc=fitdecode_module.CrcCheck.RAISE
+                    ) as fit:
+                        for frame in fit:
+                            pass  # Just iterate to trigger verification
+            except Exception as e:
                 print(f"Warning: Checksum verification failed for {fit_path.name}: {e}", file=sys.stderr)
         
         # Decode all messages
-        messages = list(fitdecode_module.decode(fit_data))
+        messages = decode_fit_data(fit_data)
         
     except Exception as e:
         print(f"Error reading {fit_path.name}: {e}", file=sys.stderr)
@@ -155,23 +201,33 @@ def process_fit_file(
     file_ids: List[Any] = []
     
     for msg in messages:
-        if isinstance(msg, fitdecode_module.messages.RECORD):
+        # New API: msg is a FitDataMessage with a 'name' attribute
+        msg_name = getattr(msg, 'name', None)
+        if msg_name == 'record':
             records.append(msg)
-        elif isinstance(msg, fitdecode_module.messages.LAP):
+        elif msg_name == 'lap':
             laps.append(msg)
-        elif isinstance(msg, fitdecode_module.messages.SESSION):
+        elif msg_name == 'session':
             sessions.append(msg)
-        elif isinstance(msg, fitdecode_module.messages.EVENT):
+        elif msg_name == 'event':
             events.append(msg)
-        elif isinstance(msg, fitdecode_module.messages.FILE_ID):
+        elif msg_name == 'file_id':
             file_ids.append(msg)
     
     # Get start timestamp for elapsed time calculation
     first_record_ts = None
     if records:
         first_record = records[0]
-        if "timestamp" in first_record:
-            first_record_ts = first_record["timestamp"]
+        ts = get_field_value(first_record, "timestamp")
+        if ts is not None:
+            # Convert to FIT timestamp format (seconds since 1989-12-31)
+            if hasattr(ts, 'timestamp'):
+                # It's a datetime object, convert to FIT timestamp
+                dt = ts
+                fit_epoch = datetime(1989, 12, 31, tzinfo=timezone.utc)
+                first_record_ts = (dt - fit_epoch).total_seconds()
+            else:
+                first_record_ts = ts
     
     # Process records
     records_data = process_records(records, first_record_ts)
@@ -219,16 +275,32 @@ def process_records(
     for i, record in enumerate(records):
         row = {}
         
+        # Get timestamp
+        ts = get_field_value(record, "timestamp")
+        
         # Calculate elapsed time
-        if first_timestamp is not None and "timestamp" in record:
-            elapsed = record["timestamp"] - first_timestamp
+        if first_timestamp is not None and ts is not None:
+            # Handle datetime objects from new API
+            if hasattr(ts, 'timestamp'):
+                ts_float = ts.timestamp()
+                # Convert to FIT timestamp (seconds since 1989-12-31)
+                fit_epoch = datetime(1989, 12, 31, tzinfo=timezone.utc)
+                ts_float = (ts - fit_epoch).total_seconds()
+                elapsed = ts_float - first_timestamp
+            else:
+                elapsed = ts - first_timestamp
             row["elapsed_s"] = int(elapsed)
         else:
             row["elapsed_s"] = ""
         
         # Timestamp
-        ts = get_field_value(record, "timestamp")
-        row["timestamp_iso8601"] = convert_timestamp(ts)
+        ts_raw = get_field_value(record, "timestamp")
+        # Handle datetime objects from new API
+        if hasattr(ts_raw, 'timestamp'):
+            dt = ts_raw
+        else:
+            dt = convert_timestamp(ts_raw)
+        row["timestamp_iso8601"] = dt
         
         # Power
         power = get_field_value(record, "power")
@@ -285,11 +357,15 @@ def process_laps(laps: List[Any]) -> List[Dict[str, Any]]:
     for i, lap in enumerate(laps):
         row = {}
         
-        row["message_index"] = lap.message_index if hasattr(lap, 'message_index') else i
+        row["message_index"] = i
         
         # Start time
-        start_time = get_field_value(lap, "start_time")
-        row["start_iso8601"] = convert_timestamp(start_time)
+        start_time_raw = get_field_value(lap, "start_time")
+        # Handle datetime objects
+        if hasattr(start_time_raw, 'strftime'):
+            row["start_iso8601"] = start_time_raw.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            row["start_iso8601"] = convert_timestamp(start_time_raw)
         
         # Elapsed time
         elapsed = get_field_value(lap, "elapsed_time")
@@ -346,23 +422,45 @@ def process_session(
     # Process FILE_ID if available
     if file_ids:
         file_id = file_ids[0]
-        for field in file_id:
-            data[f"file_{field}"] = file_id[field]
+        # New API: file_id has fields attribute
+        if hasattr(file_id, 'fields'):
+            for field in file_id.fields:
+                data[f"file_{field.name}"] = field.value
+        else:
+            # Old API
+            for field in file_id:
+                data[f"file_{field}"] = file_id[field]
     
     # Process SESSION if available
     if sessions:
         session = sessions[0]
-        for field in session:
-            # Convert distance fields
-            if field == "total_distance":
-                val = session[field]
-                data[field] = val * DISTANCE_SCALE if val is not None else None
-            # Convert timestamp fields
-            elif field.endswith("_time") or field == "start_time":
-                val = session[field]
-                data[field] = convert_timestamp(val) if val is not None else None
-            else:
-                data[field] = session[field]
+        # New API: session has fields attribute
+        if hasattr(session, 'fields'):
+            for field in session.fields:
+                # Convert distance fields
+                if field.name == "total_distance":
+                    val = field.value
+                    data[field.name] = val * DISTANCE_SCALE if val is not None else None
+                # Convert timestamp fields
+                elif field.name.endswith("_time") or field.name == "start_time":
+                    val = field.value
+                    if hasattr(val, 'strftime'):
+                        data[field.name] = val.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    else:
+                        data[field.name] = convert_timestamp(val) if val is not None else None
+                else:
+                    data[field.name] = field.value
+        else:
+            # Old API
+            for field in session:
+                if field == "total_distance":
+                    val = session[field]
+                    data[field] = val * DISTANCE_SCALE if val is not None else None
+                elif field.endswith("_time") or field == "start_time":
+                    val = session[field]
+                    data[field] = convert_timestamp(val) if val is not None else None
+                else:
+                    data[field] = session[field]
     
     return data
 
@@ -374,8 +472,11 @@ def process_events(events: List[Any]) -> List[Dict[str, Any]]:
         row = {}
         
         # Timestamp
-        ts = get_field_value(event, "timestamp")
-        row["timestamp_iso8601"] = convert_timestamp(ts)
+        ts_raw = get_field_value(event, "timestamp")
+        if hasattr(ts_raw, 'strftime'):
+            row["timestamp_iso8601"] = ts_raw.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            row["timestamp_iso8601"] = convert_timestamp(ts_raw)
         
         # Event type
         event_type = get_field_value(event, "event_type")
@@ -436,8 +537,8 @@ def validate_data(
     # Check record count vs total timer time
     if record_msgs and session_msgs:
         session_msg = session_msgs[0]
-        if "total_timer_time" in session_msg:
-            total_timer_time = session_msg["total_timer_time"]
+        total_timer_time = get_field_value(session_msg, "total_timer_time")
+        if total_timer_time is not None:
             expected_records = total_timer_time  # 1 Hz = 1 record per second
             actual_records = len(record_msgs)
             
@@ -451,9 +552,8 @@ def validate_data(
                     )
         
         # Check power average
-        if "avg_power" in session_msg:
-            session_avg_power = session_msg["avg_power"]
-            if session_avg_power is not None and session_avg_power > 0:
+        session_avg_power = get_field_value(session_msg, "avg_power")
+        if session_avg_power is not None and session_avg_power > 0:
                 # Calculate average from records
                 power_values = [
                     r["power_w"] for r in records if r["power_w"] != "" and r["power_w"] is not None
@@ -470,9 +570,8 @@ def validate_data(
                             )
         
         # Check heart rate average
-        if "avg_heart_rate" in session_msg:
-            session_avg_hr = session_msg["avg_heart_rate"]
-            if session_avg_hr is not None and session_avg_hr > 0:
+        session_avg_hr = get_field_value(session_msg, "avg_heart_rate")
+        if session_avg_hr is not None and session_avg_hr > 0:
                 # Calculate average from records
                 hr_values = [
                     r["heart_rate_bpm"] for r in records 
