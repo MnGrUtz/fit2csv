@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}fit2csv - Batch Processing{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>📦 Batch Processing</h2>
+    <p>Upload multiple FIT files to convert them all at once.</p>
+    
+    <form method="post" enctype="multipart/form-data">
+        <div class="form-group">
+            <label for="files">Select FIT Files (multiple):</label>
+            <input type="file" name="files" id="files" accept=".fit,.FIT" multiple required>
+        </div>
+        
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="verify" checked>
+                Verify FIT checksum for each file
+            </label>
+        </div>
+        
+        <button type="submit" class="btn">Convert All Files</button>
+        <a href="{{ url_for('index') }}" class="btn btn-secondary">Cancel</a>
+    </form>
+    
+    <div class="alert alert-info">
+        <p><strong>Tip:</strong> You can select multiple files by holding Ctrl (Windows/Linux) or Cmd (Mac) while clicking.</p>
+    </div>
+</div>
+{% endblock %}
